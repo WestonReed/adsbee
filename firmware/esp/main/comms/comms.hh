@@ -28,6 +28,11 @@ class CommsManager {
     static const uint32_t kWiFiSTATaskUpdateIntervalMs = 100;
     static const uint32_t kWiFiSTATaskUpdateIntervalTicks = kWiFiSTATaskUpdateIntervalMs / portTICK_PERIOD_MS;
 
+    // ForeFlight discovery constants
+    static const uint16_t kForeFlightDiscoveryPort = 63093;
+    static const uint32_t kForeFlightClientTimeoutMs = 30000;  // 30 seconds timeout
+    static const uint16_t kForeFlightMaxNumClients = 4;
+
     struct CommsManagerConfig {
         int32_t aux_spi_clk_rate_hz = 40e6;  // 40 MHz (this could go up to 80MHz).
         spi_host_device_t aux_spi_handle = SPI3_HOST;
@@ -51,12 +56,16 @@ class CommsManager {
         wifi_clients_list_mutex_ = xSemaphoreCreateMutex();
         wifi_ap_message_queue_ = xQueueCreate(kWiFiMessageQueueLen, sizeof(NetworkMessage));
         ip_wan_decoded_transponder_packet_queue_ = xQueueCreate(kWiFiMessageQueueLen, sizeof(Decoded1090Packet));
+        foreflight_clients_list_mutex_ = xSemaphoreCreateMutex();
+        foreflight_client_message_queue_ = xQueueCreate(kWiFiMessageQueueLen, sizeof(NetworkMessage));
     }
 
     ~CommsManager() {
         vSemaphoreDelete(wifi_clients_list_mutex_);
         vQueueDelete(wifi_ap_message_queue_);
         vQueueDelete(ip_wan_decoded_transponder_packet_queue_);
+        vSemaphoreDelete(foreflight_clients_list_mutex_);
+        vQueueDelete(foreflight_client_message_queue_);
     }
 
     /**
@@ -90,6 +99,15 @@ class CommsManager {
                 mac_buf_out[i] = mac >> ((5 - i) * 8);
             }
         }
+    };
+
+    struct ForeFlightClient {
+        esp_ip4_addr_t ip;
+        uint32_t last_seen_timestamp_ms;
+        uint16_t gdl90_port;
+        bool active = false;
+
+        ForeFlightClient() : gdl90_port(4000) {}  // Default GDL90 port
     };
 
     /**
@@ -163,9 +181,24 @@ class CommsManager {
     bool WiFiAccessPointSendMessageToAllStations(NetworkMessage& message);
 
     /**
+     * Send a raw UDP message to all ForeFlight clients that have been discovered via broadcast.
+     */
+    bool WiFiClientSendMessageToAllClients(NetworkMessage& message);
+
+    /**
      * Send messages to stations connected to the ESP32 access point.
      */
     void WiFiAccessPointTask(void* pvParameters);
+
+    /**
+     * Listen for ForeFlight discovery broadcasts on UDP port 63093.
+     */
+    void ForeFlightDiscoveryListenerTask(void* pvParameters);
+
+    /**
+     * Send messages to discovered ForeFlight clients.
+     */
+    void ForeFlightClientSenderTask(void* pvParameters);
 
     /**
      * Returns whether the ESP32 is connected to an external WiFi network as a station.
@@ -243,6 +276,26 @@ class CommsManager {
      */
     void WiFiRemoveClient(uint8_t* mac_buf_in);
 
+    /**
+     * Parses ForeFlight discovery message to extract GDL90 port.
+     * @param[in] message JSON message to parse.
+     * @param[out] gdl90_port GDL90 port extracted from message.
+     * @retval True if message is a valid ForeFlight discovery message, false otherwise.
+     */
+    bool ParseForeFlightDiscoveryMessage(const char* message, uint16_t* gdl90_port);
+
+    /**
+     * Adds or updates a ForeFlight client in the client list.
+     * @param[in] client_ip IP address of the ForeFlight client.
+     * @param[in] gdl90_port GDL90 port used by the client.
+     */
+    void ForeFlightAddOrUpdateClient(esp_ip4_addr_t client_ip, uint16_t gdl90_port);
+
+    /**
+     * Removes expired ForeFlight clients from the client list.
+     */
+    void ForeFlightRemoveExpiredClients();
+
     CommsManagerConfig config_;
 
     bool ethernet_was_initialized_ = false;
@@ -262,6 +315,14 @@ class CommsManager {
     uint16_t num_wifi_clients_ = 0;
     SemaphoreHandle_t wifi_clients_list_mutex_;
     QueueHandle_t wifi_ap_message_queue_;
+
+    // ForeFlight client management
+    ForeFlightClient foreflight_clients_list_[kForeFlightMaxNumClients];
+    uint16_t num_foreflight_clients_ = 0;
+    SemaphoreHandle_t foreflight_clients_list_mutex_;
+    QueueHandle_t foreflight_client_message_queue_;
+    TaskHandle_t foreflight_discovery_task_handle = nullptr;
+    TaskHandle_t foreflight_sender_task_handle = nullptr;
 
     // WiFi STA private variables.
     esp_netif_t* wifi_sta_netif_ = nullptr;

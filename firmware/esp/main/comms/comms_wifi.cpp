@@ -33,6 +33,8 @@ void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id
 }
 
 void wifi_access_point_task(void* pvParameters) { comms_manager.WiFiAccessPointTask(pvParameters); }
+void foreflight_discovery_listener_task(void* pvParameters) { comms_manager.ForeFlightDiscoveryListenerTask(pvParameters); }
+void foreflight_client_sender_task(void* pvParameters) { comms_manager.ForeFlightClientSenderTask(pvParameters); }
 inline void connect_to_wifi(void* arg = nullptr) {
     if (esp_wifi_connect() != ESP_OK) {
         CONSOLE_ERROR("connect_to_wifi", "Failed to connect to WiFi.");
@@ -231,6 +233,15 @@ bool CommsManager::WiFiInit() {
                      redacted_password);
     }
 
+    // Start ForeFlight discovery and client management tasks when WiFi is enabled
+    if (wifi_ap_enabled || wifi_sta_enabled) {
+        xTaskCreatePinnedToCore(foreflight_discovery_listener_task, "foreflight_discovery", 4096, 
+                                &foreflight_discovery_task_handle, kWiFiAPTaskPriority, NULL, kWiFiAPTaskCore);
+        xTaskCreatePinnedToCore(foreflight_client_sender_task, "foreflight_sender", 4096, 
+                                &foreflight_sender_task_handle, kWiFiAPTaskPriority, NULL, kWiFiAPTaskCore);
+        CONSOLE_INFO("CommsManager::WiFiInit", "ForeFlight discovery and client sender tasks started");
+    }
+
     return true;
 }
 
@@ -257,6 +268,222 @@ bool CommsManager::IPWANSendDecoded1090Packet(Decoded1090Packet& decoded_packet)
     } else if (err != pdTRUE) {
         CONSOLE_WARNING("CommsManager::IPWANSendDecoded1090Packet",
                         "Pushing transponder packet to WAN queue resulted in error code %d.", err);
+        return false;
+    }
+    return true;
+}
+
+// Helper function to parse ForeFlight discovery message
+bool CommsManager::ParseForeFlightDiscoveryMessage(const char* message, uint16_t* gdl90_port) {
+    // Simple parser for: { "App":"ForeFlight", "GDL90":{ "port":4000 } }
+    if (strstr(message, "\"App\":\"ForeFlight\"") == nullptr) {
+        return false;  // Not a ForeFlight message
+    }
+    
+    // Extract GDL90 port if present
+    const char* port_start = strstr(message, "\"port\":");
+    if (port_start != nullptr) {
+        port_start += 7;  // Skip "port":
+        while (*port_start == ' ' || *port_start == '\t') port_start++;  // Skip whitespace
+        *gdl90_port = (uint16_t)strtoul(port_start, nullptr, 10);
+    } else {
+        *gdl90_port = 4000;  // Default GDL90 port
+    }
+    
+    return true;
+}
+
+// Add or update a ForeFlight client in the list
+void CommsManager::ForeFlightAddOrUpdateClient(esp_ip4_addr_t client_ip, uint16_t gdl90_port) {
+    uint32_t current_time_ms = get_time_since_boot_ms();
+    
+    xSemaphoreTake(foreflight_clients_list_mutex_, portMAX_DELAY);
+    
+    // First check if client already exists (update timestamp)
+    for (int i = 0; i < kForeFlightMaxNumClients; i++) {
+        if (foreflight_clients_list_[i].active && 
+            foreflight_clients_list_[i].ip.addr == client_ip.addr) {
+            foreflight_clients_list_[i].last_seen_timestamp_ms = current_time_ms;
+            foreflight_clients_list_[i].gdl90_port = gdl90_port;
+            xSemaphoreGive(foreflight_clients_list_mutex_);
+            return;
+        }
+    }
+    
+    // Client doesn't exist, find an empty slot
+    for (int i = 0; i < kForeFlightMaxNumClients; i++) {
+        if (!foreflight_clients_list_[i].active) {
+            foreflight_clients_list_[i].ip = client_ip;
+            foreflight_clients_list_[i].last_seen_timestamp_ms = current_time_ms;
+            foreflight_clients_list_[i].gdl90_port = gdl90_port;
+            foreflight_clients_list_[i].active = true;
+            num_foreflight_clients_++;
+            char client_ip_str[SettingsManager::Settings::kIPAddrStrLen + 1];
+            snprintf(client_ip_str, SettingsManager::Settings::kIPAddrStrLen, IPSTR, IP2STR(&client_ip));
+            CONSOLE_INFO("CommsManager::ForeFlightAddOrUpdateClient", 
+                        "Added ForeFlight client %s, GDL90 port %d", client_ip_str, gdl90_port);
+            break;
+        }
+    }
+    
+    xSemaphoreGive(foreflight_clients_list_mutex_);
+}
+
+// Remove expired ForeFlight clients
+void CommsManager::ForeFlightRemoveExpiredClients() {
+    uint32_t current_time_ms = get_time_since_boot_ms();
+    
+    xSemaphoreTake(foreflight_clients_list_mutex_, portMAX_DELAY);
+    
+    for (int i = 0; i < kForeFlightMaxNumClients; i++) {
+        if (foreflight_clients_list_[i].active && 
+            (current_time_ms - foreflight_clients_list_[i].last_seen_timestamp_ms) > kForeFlightClientTimeoutMs) {
+            char client_ip_str[SettingsManager::Settings::kIPAddrStrLen + 1];
+            snprintf(client_ip_str, SettingsManager::Settings::kIPAddrStrLen, IPSTR, 
+                    IP2STR(&foreflight_clients_list_[i].ip));
+            CONSOLE_INFO("CommsManager::ForeFlightRemoveExpiredClients", 
+                        "Removed expired ForeFlight client %s", client_ip_str);
+            foreflight_clients_list_[i].active = false;
+            num_foreflight_clients_--;
+        }
+    }
+    
+    xSemaphoreGive(foreflight_clients_list_mutex_);
+}
+
+void CommsManager::ForeFlightDiscoveryListenerTask(void* pvParameters) {
+    struct sockaddr_in server_addr, client_addr;
+    socklen_t client_addr_len = sizeof(client_addr);
+    char rx_buffer[256];
+    
+    // Create UDP socket
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock < 0) {
+        CONSOLE_ERROR("CommsManager::ForeFlightDiscoveryListenerTask", "Unable to create socket: errno %d", errno);
+        return;
+    }
+    
+    // Set socket to reuse address
+    int enable = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &enable, sizeof(enable)) < 0) {
+        CONSOLE_ERROR("CommsManager::ForeFlightDiscoveryListenerTask", "setsockopt(SO_REUSEADDR) failed: errno %d", errno);
+    }
+    
+    // Bind to ForeFlight discovery port
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_addr.s_addr = INADDR_ANY;
+    server_addr.sin_port = htons(kForeFlightDiscoveryPort);
+    
+    if (bind(sock, (struct sockaddr*)&server_addr, sizeof(server_addr)) < 0) {
+        CONSOLE_ERROR("CommsManager::ForeFlightDiscoveryListenerTask", "Socket bind failed: errno %d", errno);
+        close(sock);
+        return;
+    }
+    
+    CONSOLE_INFO("CommsManager::ForeFlightDiscoveryListenerTask", "Listening for ForeFlight broadcasts on port %d", kForeFlightDiscoveryPort);
+    
+    // Set receive timeout
+    struct timeval timeout;
+    timeout.tv_sec = 5;  // 5 second timeout for cleanup
+    timeout.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+    
+    while (true) {
+        int len = recvfrom(sock, rx_buffer, sizeof(rx_buffer) - 1, 0, 
+                          (struct sockaddr*)&client_addr, &client_addr_len);
+        
+        if (len > 0) {
+            rx_buffer[len] = '\0';  // Null terminate
+            
+            uint16_t gdl90_port;
+            if (ParseForeFlightDiscoveryMessage(rx_buffer, &gdl90_port)) {
+                esp_ip4_addr_t client_ip;
+                client_ip.addr = client_addr.sin_addr.s_addr;
+                ForeFlightAddOrUpdateClient(client_ip, gdl90_port);
+            }
+        } else if (len < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            // Real error occurred
+            CONSOLE_ERROR("CommsManager::ForeFlightDiscoveryListenerTask", "recvfrom failed: errno %d", errno);
+        }
+        
+        // Periodically clean up expired clients
+        static uint32_t last_cleanup_time_ms = 0;
+        uint32_t current_time_ms = get_time_since_boot_ms();
+        if (current_time_ms - last_cleanup_time_ms > 10000) {  // Every 10 seconds
+            ForeFlightRemoveExpiredClients();
+            last_cleanup_time_ms = current_time_ms;
+        }
+    }
+    
+    close(sock);
+}
+
+void CommsManager::ForeFlightClientSenderTask(void* pvParameters) {
+    NetworkMessage message;
+    
+    // Create socket
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (sock < 0) {
+        CONSOLE_ERROR("CommsManager::ForeFlightClientSenderTask", "Unable to create socket: errno %d", errno);
+        return;
+    }
+    
+    // Set timeout
+    struct timeval timeout;
+    timeout.tv_sec = 10;
+    timeout.tv_usec = 0;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout);
+    
+    while (true) {
+        if (xQueueReceive(foreflight_client_message_queue_, &message, portMAX_DELAY) == pdTRUE) {
+            struct sockaddr_in dest_addr;
+            dest_addr.sin_family = AF_INET;
+            
+            xSemaphoreTake(foreflight_clients_list_mutex_, portMAX_DELAY);
+            for (int i = 0; i < kForeFlightMaxNumClients; i++) {
+                if (foreflight_clients_list_[i].active) {
+                    dest_addr.sin_addr.s_addr = foreflight_clients_list_[i].ip.addr;
+                    dest_addr.sin_port = htons(foreflight_clients_list_[i].gdl90_port);
+                    
+                    int ret = 0;
+                    uint16_t num_tries;
+                    for (num_tries = 0; num_tries < kWiFiNumRetries; num_tries++) {
+                        ret = sendto(sock, message.data, message.len, 0, 
+                                   (struct sockaddr*)&dest_addr, sizeof(dest_addr));
+                        if (ret >= 0 || errno != ENOMEM) {
+                            break;
+                        }
+                        vTaskDelay(kWiFiRetryWaitTimeMs / portTICK_PERIOD_MS);
+                    }
+                    
+                    if (ret < 0) {
+                        CONSOLE_ERROR("CommsManager::ForeFlightClientSenderTask",
+                                     "Error occurred during sending: errno %d. Tried %d times.", errno, num_tries);
+                    }
+                }
+            }
+            xSemaphoreGive(foreflight_clients_list_mutex_);
+        }
+    }
+    shutdown(sock, 0);
+    close(sock);
+}
+
+bool CommsManager::WiFiClientSendMessageToAllClients(NetworkMessage& message) {
+    if (num_foreflight_clients_ == 0) {
+        CONSOLE_WARNING("CommsManager::WiFiClientSendMessageToAllClients",
+                        "No ForeFlight clients discovered yet.");
+        return false;
+    }
+    
+    int err = xQueueSend(foreflight_client_message_queue_, &message, 0);
+    if (err == errQUEUE_FULL) {
+        CONSOLE_WARNING("CommsManager::WiFiClientSendMessageToAllClients", "Overflowed ForeFlight client message queue.");
+        xQueueReset(foreflight_client_message_queue_);
+        return false;
+    } else if (err != pdTRUE) {
+        CONSOLE_WARNING("CommsManager::WiFiClientSendMessageToAllClients",
+                        "Pushing message to ForeFlight client message queue resulted in error code %d.", err);
         return false;
     }
     return true;
